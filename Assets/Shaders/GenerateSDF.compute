@@ -1,0 +1,169 @@
+#pragma kernel CSMain
+#pragma target 5.0
+#pragma prefer_hlslcc gles
+#pragma exclude_renderers d3d11_9x d3d12_9x
+#pragma enable_d3d11_debug_symbols
+
+int _Resolution;
+int _CubeSize;
+
+struct BVHNode {
+    float3 min;
+    float3 max;
+    int leftChild;
+    int rightChild;
+    int triangleStart;
+    int triangleCount;
+};
+
+struct Triangle {
+    float3 a;
+    float3 b;
+    float3 c;
+};
+
+StructuredBuffer<BVHNode> _BVHNodes;
+StructuredBuffer<Triangle> _Triangles;
+// 使用RWBuffer存储SDF数据
+RWBuffer<float> _SDFBuffer;
+RWBuffer<float> _TestBuffer;
+
+// 点到线段的最近点
+float3 ClosestPointOnEdge(float3 p, float3 a, float3 b) {
+    float3 ab = b - a;
+    float t = dot(p - a, ab) / dot(ab, ab);
+    t = saturate(t);
+    return a + t * ab;
+}
+
+// 修复方向问题并增强鲁棒性
+float SignedDistanceToTriangle(float3 p, Triangle tri) {
+    
+    // 统一使用起点指向终点的向量
+    float3 ab = tri.b - tri.a; // A→B
+    float3 bc = tri.c - tri.b; // B→C
+    float3 ca = tri.a - tri.c; // C→A（物理方向）
+
+    // 使用两条边计算法向量 (ab 和 ac，其中 ac = -ca)
+    float3 ac = tri.c - tri.a; // A→C（逻辑方向）
+    float3 norm = cross(ab, ac);
+    float normLength = length(norm);
+    if (normLength < 1e-8) return 1e10;
+    norm /= normLength;
+
+    // 平面方程和带符号距离
+    float dist = dot(norm, p - tri.a); // 等价于 dot(norm,p) - dot(norm,tri.a)
+    float3 proj = p - dist * norm;
+
+    // 检查投影点是否在三角形内（兼容任意顶点顺序）
+    float c0 = dot(cross(ab, proj - tri.a), norm); // AB边
+    float c1 = dot(cross(bc, proj - tri.b), norm); // BC边
+    float c2 = dot(cross(ca, proj - tri.c), norm); // CA边
+
+    // 修复：检查同号而非全非负
+    if ((c0 >= 0 && c1 >= 0 && c2 >= 0) || (c0 <= 0 && c1 <= 0 && c2 <= 0)) {
+        return dist;
+    }
+    
+    // 计算到三条边的最短距离
+    float d1 = distance(p, ClosestPointOnEdge(p, tri.a, tri.b));
+    float d2 = distance(p, ClosestPointOnEdge(p, tri.b, tri.c));
+    float d3 = distance(p, ClosestPointOnEdge(p, tri.c, tri.a));
+    float minDist = min(min(d1, d2), d3);
+
+    // 符号由平面距离决定
+    if (dist == 0)
+        return abs(minDist);
+    return minDist * sign(dist);
+}
+
+// 计算点到AABB的距离
+float DistanceToAABB(float3 pos, float3 minB, float3 maxB) {
+    float3 closest = clamp(pos, minB, maxB);
+    return distance(pos, closest);
+}
+
+
+// BVH遍历函数
+float QuerySDF(float3 pos) {
+    float minDist = 1e10; // 初始化为大数
+    
+    // 使用栈进行迭代遍历
+    int stack[64];
+    int stackPtr = 0;
+    stack[stackPtr++] = 0; // 根节点索引
+
+    while (stackPtr > 0) {
+        int nodeIdx = stack[--stackPtr];
+        BVHNode node = _BVHNodes[nodeIdx];
+
+        // 计算到当前节点包围盒的距离
+        float distToBox = DistanceToAABB(pos, node.min, node.max);
+        
+        // 如果当前最小距离小于到包围盒距离，跳过该节点
+        if (distToBox >= abs(minDist)) {
+            continue;
+        }
+        
+        // 叶子节点处理
+        if (node.leftChild < 0) {
+            // 处理所有三角形
+            for (int i = 0; i < node.triangleCount; i++) {
+                Triangle tri = _Triangles[node.triangleStart + i];
+                float dist = SignedDistanceToTriangle(pos, tri);
+                
+                // 保留绝对值最小的有符号距离
+                if (abs(dist) < abs(minDist)) {
+                    minDist = dist;
+                }
+            }
+        }
+        else {
+            // 内部节点 - 处理子节点
+            int leftChild = node.leftChild;
+            int rightChild = node.rightChild;
+            
+            float distLeft = DistanceToAABB(pos, _BVHNodes[leftChild].min, _BVHNodes[leftChild].max);
+            //return distLeft;
+            float distRight = DistanceToAABB(pos, _BVHNodes[rightChild].min, _BVHNodes[rightChild].max);
+            //return distRight;
+            
+            // 按距离排序，先处理更近的节点
+            if (distLeft < distRight) {
+                stack[stackPtr++] = rightChild;
+                stack[stackPtr++] = leftChild;
+            } else {
+                stack[stackPtr++] = leftChild;
+                stack[stackPtr++] = rightChild;
+            }
+        }
+    }
+
+    return minDist;
+}
+
+[numthreads(8,8,8)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    // 确保在边界内
+    int cnt = _Resolution;
+    
+    if (id.x >= cnt || id.y >= cnt || id.z >= cnt)
+        return;
+    
+    // 转换到世界空间
+    float cubeSize = _CubeSize;
+    float halfSize = cubeSize / 2;
+    float stepSize = cubeSize / (_Resolution - 1);
+    float3 pos = float3(id.x * stepSize - halfSize, id.y * stepSize - halfSize, id.z * stepSize - halfSize);
+    
+    // // 计算SDF值
+    float sdf = QuerySDF(pos);
+    
+    // 计算一维索引
+    uint index = id.x + id.y * cnt + id.z * cnt * cnt;
+    
+    // 写入到缓冲区
+    _SDFBuffer[index] = sdf;
+    
+}
